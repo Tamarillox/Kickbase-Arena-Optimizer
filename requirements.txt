@@ -1,7 +1,10 @@
 streamlit>=1.30
 requests
 beautifulsoup4
-rapidfuzz
+cloudscraper
+lxml
 pulp
 pandas
+rapidfuzz
 python-dotenv
+numpy
