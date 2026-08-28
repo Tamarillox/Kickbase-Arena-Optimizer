@@ -5,5 +5,3 @@ rapidfuzz
 pulp
 pandas
 python-dotenv
-cloudscraper
-lxml

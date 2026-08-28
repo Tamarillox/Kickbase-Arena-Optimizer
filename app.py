@@ -1,9 +1,11 @@
 """
-app.py – Streamlit Dashboard für den Kickbase Arena Optimizer
+app.py – Streamlit Dashboard für den Kickbase Arena Optimizer & KickTipp
 Features:
+- Kickbase Lineup Optimization mit ILP-Solver
 - Spieler-Sperrliste (Sperren & Re-Optimize)
 - Formations-Vergleich
 - Permanente manuelle Marktwert-Korrekturen (gespeichert in custom_market_values.json)
+- Live LigaInsider Scraping & KickTipp-Spieltagsprognosen
 """
 
 import json
@@ -12,12 +14,13 @@ import streamlit as st
 import pandas as pd
 from data_collector import run_pipeline, KickbaseAPIError, LigaInsiderError
 from optimizer import optimize_lineup, get_valid_formations, OptimizationError
+from kicktipp_engine import run_kicktipp_live_pipeline
 
 # ---------------------------------------------------------------------------
 # Page Config & Persistence Helpers
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="⚽ Kickbase Arena Optimizer",
+    page_title="⚽ Kickbase & KickTipp Optimizer",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -50,12 +53,12 @@ def apply_custom_market_values(df: pd.DataFrame, custom_mvs: dict) -> pd.DataFra
 
     df = df.copy()
     for pid_or_name, val in custom_mvs.items():
-        # Zuerst nach ID suchen, falls numerisch/ID-Match
+        # Zuerst nach ID suchen
         mask_id = df["id"].astype(str) == str(pid_or_name)
         if mask_id.any():
             df.loc[mask_id, "market_value"] = float(val)
         else:
-            # Fallback: Nach Namen matchen
+            # Fallback: Nach Spielernamen matchen
             mask_name = df["name"].astype(str).str.strip().str.lower() == str(pid_or_name).strip().lower()
             if mask_name.any():
                 df.loc[mask_name, "market_value"] = float(val)
@@ -75,44 +78,59 @@ if "locked_out_players" not in st.session_state:
     st.session_state["locked_out_players"] = {}
 if "custom_mvs" not in st.session_state:
     st.session_state["custom_mvs"] = load_custom_market_values()
+if "kicktipp_results" not in st.session_state:
+    st.session_state["kicktipp_results"] = None
 
 # ---------------------------------------------------------------------------
-# Custom CSS
+# Responsive CSS (Desktop + Mobile)
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
     .main .block-container { padding-top: 1.5rem; max-width: 1200px; }
     .pitch-container {
         background: linear-gradient(180deg, #1b5e20 0%, #2e7d32 30%, #388e3c 60%, #43a047 100%);
-        border-radius: 16px; padding: 2rem 1rem; margin: 1rem 0; position: relative;
-        min-height: 500px; border: 3px solid rgba(255,255,255,0.15);
+        border-radius: 16px; padding: 1.5rem 1rem; margin: 1rem 0; position: relative;
+        min-height: 480px; border: 3px solid rgba(255,255,255,0.15);
         box-shadow: 0 8px 32px rgba(0,0,0,0.3);
     }
     .player-card {
-        background: rgba(255,255,255,0.95); border-radius: 12px; padding: 0.6rem 0.8rem;
+        background: rgba(255,255,255,0.95); border-radius: 10px; padding: 0.5rem 0.6rem;
         text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        transition: transform 0.2s ease; min-width: 100px;
+        transition: transform 0.2s ease; min-width: 0;
     }
     .player-card:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
-    .player-card .name { font-weight: 700; font-size: 0.85rem; color: #1a1a1a; margin-bottom: 2px; }
-    .player-card .team { font-size: 0.7rem; color: #666; margin-bottom: 3px; }
-    .player-card .xp { font-size: 0.8rem; color: #1b5e20; font-weight: 600; }
+    .player-card .name {
+        font-weight: 700; font-size: 0.8rem; color: #1a1a1a; margin-bottom: 2px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .player-card .team { font-size: 0.65rem; color: #666; margin-bottom: 3px; }
+    .player-card .xp { font-size: 0.75rem; color: #1b5e20; font-weight: 700; }
     .player-card .mv { font-size: 0.65rem; color: #888; }
     .captain-badge {
         display: inline-block; background: linear-gradient(135deg, #ffd700, #ffb300);
-        color: #1a1a1a; font-weight: 800; font-size: 0.65rem; padding: 1px 6px;
-        border-radius: 8px; margin-left: 4px;
+        color: #1a1a1a; font-weight: 800; font-size: 0.6rem; padding: 1px 5px;
+        border-radius: 6px; margin-left: 3px;
     }
     .kpi-card {
         background: linear-gradient(135deg, #f8f9fa, #e9ecef); border-radius: 12px;
-        padding: 1.2rem; text-align: center; border: 1px solid #dee2e6;
+        padding: 1rem; text-align: center; border: 1px solid #dee2e6;
         box-shadow: 0 2px 8px rgba(0,0,0,0.06);
     }
-    .kpi-card .value { font-size: 1.8rem; font-weight: 800; color: #1b5e20; }
-    .kpi-card .label { font-size: 0.8rem; color: #6c757d; text-transform: uppercase; letter-spacing: 1px; }
+    .kpi-card .value { font-size: 1.6rem; font-weight: 800; color: #1b5e20; }
+    .kpi-card .label { font-size: 0.75rem; color: #6c757d; text-transform: uppercase; letter-spacing: 1px; }
     .section-header {
         font-size: 1.1rem; font-weight: 700; color: #1a1a1a;
-        margin: 1.5rem 0 0.8rem 0; padding-bottom: 0.4rem; border-bottom: 2px solid #1b5e20;
+        margin: 1.2rem 0 0.6rem 0; padding-bottom: 0.3rem; border-bottom: 2px solid #1b5e20;
+    }
+    
+    /* Mobile Media Queries */
+    @media (max-width: 768px) {
+        .main .block-container { padding: 0.8rem 0.3rem; }
+        .player-card { padding: 0.3rem 0.2rem; }
+        .player-card .name { font-size: 0.65rem; }
+        .player-card .xp, .player-card .mv { font-size: 0.55rem; }
+        .kpi-card .value { font-size: 1.2rem; }
+        .kpi-card .label { font-size: 0.65rem; }
     }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -203,19 +221,19 @@ def render_detail_table(lineup: pd.DataFrame, captain_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar (Lineup & Persistenz)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("# ⚽ Kickbase Arena")
-    st.markdown("### Lineup Optimizer")
+    st.markdown("# ⚽ Kickbase & KickTipp")
+    st.markdown("### Manager Dashboard")
     st.markdown("---")
 
-    st.markdown("#### 🔑 Zugangsdaten")
+    st.markdown("#### 🔑 Kickbase Zugangsdaten")
     email = st.text_input("Kickbase E-Mail", value=st.session_state.get("kb_email", ""), placeholder="deine@email.de")
     password = st.text_input("Kickbase Passwort", value=st.session_state.get("kb_password", ""), type="password", placeholder="Dein Passwort")
 
     st.markdown("---")
-    st.markdown("#### ⚙️ Einstellungen")
+    st.markdown("#### ⚙️ Arena-Einstellungen")
 
     budget = st.slider("💰 Budget (Mio. €)", min_value=50, max_value=300, value=150, step=5)
     budget_value = budget * 1_000_000
@@ -228,7 +246,7 @@ with st.sidebar:
     st.markdown("---")
     sync_clicked = st.button("🔄 Daten neu laden & Optimieren", type="primary", use_container_width=True)
 
-    # Gesperrte Spieler Übersicht in Sidebar
+    # Gesperrte Spieler Übersicht
     if st.session_state["locked_out_players"]:
         st.markdown("---")
         st.markdown("#### 🚫 Gesperrte Spieler")
@@ -243,7 +261,7 @@ with st.sidebar:
             st.session_state["locked_out_players"] = {}
             st.rerun()
 
-    # Dauerhafte Marktwert-Korrektur Übersicht in Sidebar
+    # Gespeicherte manuelle Marktwerte
     st.markdown("---")
     st.markdown("#### 💰 Gespeicherte Marktwerte")
     if st.session_state["custom_mvs"]:
@@ -254,12 +272,11 @@ with st.sidebar:
                 del st.session_state["custom_mvs"][p_key]
                 save_custom_market_values(st.session_state["custom_mvs"])
                 if st.session_state.get("optimizable") is not None:
-                    # Neu anwenden
                     all_p = st.session_state["all_players"].copy()
                     st.session_state["optimizable"] = apply_custom_market_values(all_p, st.session_state["custom_mvs"])
                 st.rerun()
 
-        if st.button("🗑️ Alle Marktwert-Korrekturen löschen", use_container_width=True):
+        if st.button("🗑️ Alle Korrekturen löschen", use_container_width=True):
             st.session_state["custom_mvs"] = {}
             save_custom_market_values({})
             st.rerun()
@@ -268,92 +285,133 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Main Logic
+# Hauptbereich mit Tabs
 # ---------------------------------------------------------------------------
 st.markdown(
-    "<h1 style='text-align:center;margin-bottom:0;'>⚽ Kickbase Arena Optimizer</h1>"
+    "<h1 style='text-align:center;margin-bottom:0;'>⚽ Kickbase Arena & KickTipp</h1>"
     "<p style='text-align:center;color:#666;margin-top:0.2rem;'>"
-    "Die punktemaximale Aufstellung für deinen nächsten Spieltag</p>",
+    "Optimale Aufstellungen & datenbasierte Spieltagsprognosen</p>",
     unsafe_allow_html=True,
 )
 
-# 1. Pipeline ausführen wenn Login geklickt
-if sync_clicked:
-    if not email or not password:
-        st.error("⚠️ Bitte E-Mail und Passwort eingeben.")
-    else:
-        st.session_state["kb_email"] = email
-        st.session_state["kb_password"] = password
-
-        with st.spinner("🔄 Kickbase-Login & Spieler-Abruf..."):
-            try:
-                all_players, optimizable = run_pipeline(email, password)
-                # Manuell gespeicherte Marktwerte sofort anwenden
-                optimizable = apply_custom_market_values(optimizable, st.session_state["custom_mvs"])
-                st.session_state["all_players"] = all_players
-                st.session_state["optimizable"] = optimizable
-            except KickbaseAPIError as e:
-                st.error(f"❌ Kickbase-Fehler: {e}")
-                st.stop()
-            except Exception as e:
-                st.error(f"❌ Unerwarteter Fehler: {e}")
-                st.stop()
-
-        with st.spinner("🧮 Optimierung läuft..."):
-            try:
-                result = optimize_lineup(
-                    st.session_state["optimizable"],
-                    budget=budget_value,
-                    formation=formation_key,
-                    excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
-                )
-                st.session_state["result"] = result
-            except OptimizationError as e:
-                st.error(f"❌ {e}")
-                st.stop()
+tab_optimizer, tab_kicktipp = st.tabs(["🧮 Lineup Optimizer", "🎯 KickTipp Prognosen"])
 
 
-# 2. Wenn Daten existieren: Manuelle Marktwert-Änderung & Sperr-Bereich
-if st.session_state.get("optimizable") is not None and st.session_state.get("result") is not None:
-    current_lineup = st.session_state["result"]["lineup"]
+# ===========================================================================
+# TAB 1: KICKBASE LINEUP OPTIMIZER
+# ===========================================================================
+with tab_optimizer:
+    # 1. Pipeline ausführen wenn Login geklickt
+    if sync_clicked:
+        if not email or not password:
+            st.error("⚠️ Bitte E-Mail und Passwort in der Sidebar eingeben.")
+        else:
+            st.session_state["kb_email"] = email
+            st.session_state["kb_password"] = password
 
-    # --- BEREICH: MARKTWERT MANUELL ANPASSEN ---
-    with st.expander("✏️ Marktwert eines Spielers manuell anpassen & dauerhaft speichern", expanded=False):
-        opt_df = st.session_state["optimizable"]
-        player_names = sorted(opt_df["name"].dropna().unique().tolist())
-        
-        edit_col1, edit_col2, edit_col3 = st.columns([2, 2, 1])
-        with edit_col1:
-            selected_player = st.selectbox("Spieler wählen:", options=player_names, index=0 if player_names else None)
-        
-        current_val = 0.0
-        if selected_player:
-            match_row = opt_df[opt_df["name"] == selected_player]
-            if not match_row.empty:
-                current_val = float(match_row.iloc[0]["market_value"])
+            with st.spinner("🔄 Kickbase-Login & Spieler-Abruf..."):
+                try:
+                    all_players, optimizable = run_pipeline(email, password)
+                    # Manuell gespeicherte Marktwerte anwenden
+                    optimizable = apply_custom_market_values(optimizable, st.session_state["custom_mvs"])
+                    st.session_state["all_players"] = all_players
+                    st.session_state["optimizable"] = optimizable
+                except KickbaseAPIError as e:
+                    st.error(f"❌ Kickbase-Fehler: {e}")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"❌ Unerwarteter Fehler: {e}")
+                    st.stop()
 
-        with edit_col2:
-            new_mv_input = st.number_input(
-                "Neuer Marktwert in € (z. B. 2800000):",
-                value=int(current_val),
-                step=100_000,
-                format="%d"
-            )
-
-        with edit_col3:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("💾 Speichern & Anwenden", type="primary", use_container_width=True):
-                if selected_player and new_mv_input > 0:
-                    st.session_state["custom_mvs"][selected_player] = float(new_mv_input)
-                    save_custom_market_values(st.session_state["custom_mvs"])
-                    
-                    # Wert direkt im Datensatz überschreiben
-                    st.session_state["optimizable"] = apply_custom_market_values(
+            with st.spinner("🧮 Optimierung läuft..."):
+                try:
+                    result = optimize_lineup(
                         st.session_state["optimizable"],
-                        st.session_state["custom_mvs"]
+                        budget=budget_value,
+                        formation=formation_key,
+                        excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
                     )
-                    
-                    # Sofort neu berechnen
+                    st.session_state["result"] = result
+                except OptimizationError as e:
+                    st.error(f"❌ {e}")
+                    st.stop()
+
+    # 2. Wenn Daten geladen sind: Manuelle Marktwert-Änderung & Sperrliste
+    if st.session_state.get("optimizable") is not None and st.session_state.get("result") is not None:
+        current_lineup = st.session_state["result"]["lineup"]
+
+        # --- BEREICH: MARKTWERT MANUELL ANPASSEN ---
+        with st.expander("✏️ Marktwert eines Spielers manuell anpassen & dauerhaft speichern", expanded=False):
+            opt_df = st.session_state["optimizable"]
+            player_names = sorted(opt_df["name"].dropna().unique().tolist())
+            
+            edit_col1, edit_col2, edit_col3 = st.columns([2, 2, 1])
+            with edit_col1:
+                selected_player = st.selectbox("Spieler wählen:", options=player_names, index=0 if player_names else None)
+            
+            current_val = 0.0
+            if selected_player:
+                match_row = opt_df[opt_df["name"] == selected_player]
+                if not match_row.empty:
+                    current_val = float(match_row.iloc[0]["market_value"])
+
+            with edit_col2:
+                new_mv_input = st.number_input(
+                    "Neuer Marktwert in € (z. B. 2800000):",
+                    value=int(current_val),
+                    step=100_000,
+                    format="%d"
+                )
+
+            with edit_col3:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("💾 Speichern & Anwenden", type="primary", use_container_width=True):
+                    if selected_player and new_mv_input > 0:
+                        st.session_state["custom_mvs"][selected_player] = float(new_mv_input)
+                        save_custom_market_values(st.session_state["custom_mvs"])
+                        
+                        st.session_state["optimizable"] = apply_custom_market_values(
+                            st.session_state["optimizable"],
+                            st.session_state["custom_mvs"]
+                        )
+                        
+                        try:
+                            new_result = optimize_lineup(
+                                st.session_state["optimizable"],
+                                budget=budget_value,
+                                formation=formation_key,
+                                excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
+                            )
+                            st.session_state["result"] = new_result
+                            st.success(f"Marktwert für {selected_player} auf {format_market_value(new_mv_input)} gesetzt!")
+                            st.rerun()
+                        except OptimizationError as e:
+                            st.error(f"❌ {e}")
+
+        # --- BEREICH: SPIELER SPERREN ---
+        st.markdown("---")
+        st.markdown("### 🚫 Spieler sperren & Neu berechnen")
+        
+        player_choices = {
+            f"{row['name']} ({row.get('team', '')} - {row['position_label']})": str(row['id'])
+            for _, row in current_lineup.iterrows()
+        }
+
+        selected_to_block = st.multiselect(
+            "Wähle Spieler aus der aktuellen Elf aus, die du ausschließen willst:",
+            options=list(player_choices.keys()),
+            placeholder="Spieler zum Sperren auswählen...",
+        )
+
+        col_btn1, col_btn2 = st.columns([2, 1])
+        with col_btn1:
+            if st.button("🚫 Ausgewählte Spieler sperren & Neue Elf berechnen", type="primary", use_container_width=True):
+                if selected_to_block:
+                    for label in selected_to_block:
+                        p_id = player_choices[label]
+                        p_name = label.split(" (")[0]
+                        st.session_state["locked_out_players"][p_id] = p_name
+
                     try:
                         new_result = optimize_lineup(
                             st.session_state["optimizable"],
@@ -362,94 +420,99 @@ if st.session_state.get("optimizable") is not None and st.session_state.get("res
                             excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
                         )
                         st.session_state["result"] = new_result
-                        st.success(f"Marktwert für {selected_player} auf {format_market_value(new_mv_input)} gesetzt!")
                         st.rerun()
                     except OptimizationError as e:
                         st.error(f"❌ {e}")
 
-    # --- BEREICH: SPIELER SPERREN ---
-    st.markdown("---")
-    st.markdown("### 🚫 Spieler sperren & Neu berechnen")
-    
-    player_choices = {
-        f"{row['name']} ({row.get('team', '')} - {row['position_label']})": str(row['id'])
-        for _, row in current_lineup.iterrows()
-    }
+        with col_btn2:
+            if st.button("🔄 Ohne Änderungen neu optimieren", use_container_width=True):
+                new_result = optimize_lineup(
+                    st.session_state["optimizable"],
+                    budget=budget_value,
+                    formation=formation_key,
+                    excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
+                )
+                st.session_state["result"] = new_result
+                st.rerun()
 
-    selected_to_block = st.multiselect(
-        "Wähle Spieler aus der aktuellen Elf aus, die du für die nächste Berechnung ausschließen willst:",
-        options=list(player_choices.keys()),
-        placeholder="Spieler zum Sperren auswählen...",
-    )
+    # 3. Anzeige des Spielfelds & KPIs
+    result = st.session_state.get("result")
+    if result:
+        render_kpis(result)
+        
+        if "all_formation_scores" in result and result["all_formation_scores"]:
+            with st.expander("🔍 Mathematischer Formations-Vergleich (xP aller Formationen)", expanded=False):
+                scores_df = pd.DataFrame(
+                    [
+                        {"Formation": f, "Erreichbare xP": pts, "Gewählt": "✅ Ja" if f == result["formation"] else "Nein"}
+                        for f, pts in sorted(result["all_formation_scores"].items(), key=lambda x: x[1], reverse=True)
+                    ]
+                )
+                st.dataframe(scores_df, use_container_width=True, hide_index=True)
 
-    col_btn1, col_btn2 = st.columns([2, 1])
-    with col_btn1:
-        if st.button("🚫 Ausgewählte Spieler sperren & Neue Elf berechnen", type="primary", use_container_width=True):
-            if selected_to_block:
-                for label in selected_to_block:
-                    p_id = player_choices[label]
-                    p_name = label.split(" (")[0]
-                    st.session_state["locked_out_players"][p_id] = p_name
+        st.markdown("")
+        render_pitch(result["lineup"], result["captain_id"])
+        st.markdown("")
+        render_detail_table(result["lineup"], result["captain_id"])
+    else:
+        st.markdown("---")
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown(
+                """
+                <div style="text-align:center; padding:3rem 2rem; background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+                            border-radius:16px; border:1px solid #dee2e6;">
+                    <div style="font-size:3rem; margin-bottom:1rem;">🏟️</div>
+                    <h3 style="color:#1a1a1a; margin:0 0 0.5rem;">Bereit für den Spieltag?</h3>
+                    <p style="color:#666; margin:0; font-size:0.9rem;">
+                        Gib deine Zugangsdaten ein und klicke auf <strong>„Daten neu laden & Optimieren"</strong>.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-                try:
-                    new_result = optimize_lineup(
-                        st.session_state["optimizable"],
-                        budget=budget_value,
-                        formation=formation_key,
-                        excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
+
+# ===========================================================================
+# TAB 2: KICKTIPP LIVE-PROGNOSEN
+# ===========================================================================
+with tab_kicktipp:
+    st.markdown("### 🎯 KickTipp Live-Analyse & Spieltagstipps")
+    st.caption("Scraped LigaInsider nach aktuellen Ausfällen, Verletzungen und berechnet Stärketrends.")
+
+    btn_scrape_kt = st.button("🔄 LigaInsider jetzt live analysieren & Tipps berechnen", type="primary")
+
+    if btn_scrape_kt or st.session_state["kicktipp_results"] is None:
+        with st.spinner("🕵️ Scrape LigaInsider-Ausfälle & berechne Spieltagsprognosen..."):
+            st.session_state["kicktipp_results"] = run_kicktipp_live_pipeline()
+
+    kt_data = st.session_state["kicktipp_results"]
+
+    if kt_data:
+        st.success(f"✅ Analyse abgeschlossen: {kt_data['total_injuries_scraped']} Ausfälle/Statusmeldungen von LigaInsider berücksichtigt.")
+        
+        st.markdown("#### ⚽ Berechnete Spieltagsergebnisse")
+        for match in kt_data["predictions"]:
+            with st.container():
+                c1, c2, c3 = st.columns([3, 1, 4])
+                with c1:
+                    st.markdown(f"**{match['home']}** – **{match['away']}**")
+                with c2:
+                    st.markdown(
+                        f"<span style='background:#1b5e20;color:white;padding:3px 10px;border-radius:6px;font-weight:bold;font-size:1.05rem;'>{match['tip']}</span>",
+                        unsafe_allow_html=True,
                     )
-                    st.session_state["result"] = new_result
-                    st.rerun()
-                except OptimizationError as e:
-                    st.error(f"❌ {e}")
+                with c3:
+                    st.caption(match["analysis"])
+                st.markdown("<hr style='margin: 0.2rem 0; border: none; border-top: 1px solid #eee;'>", unsafe_allow_html=True)
 
-    with col_btn2:
-        if st.button("🔄 Ohne Änderungen neu optimieren", use_container_width=True):
-            new_result = optimize_lineup(
-                st.session_state["optimizable"],
-                budget=budget_value,
-                formation=formation_key,
-                excluded_player_ids=list(st.session_state["locked_out_players"].keys()),
-            )
-            st.session_state["result"] = new_result
-            st.rerun()
-
-
-# 3. Anzeige der Ergebnisse
-result = st.session_state.get("result")
-if result:
-    render_kpis(result)
-    
-    # Formations-Vergleich
-    if "all_formation_scores" in result and result["all_formation_scores"]:
-        with st.expander("🔍 Mathematischer Formations-Vergleich (xP aller Formationen)", expanded=False):
-            scores_df = pd.DataFrame(
-                [
-                    {"Formation": f, "Erreichbare xP": pts, "Gewählt": "✅ Ja" if f == result["formation"] else "Nein"}
-                    for f, pts in sorted(result["all_formation_scores"].items(), key=lambda x: x[1], reverse=True)
-                ]
-            )
-            st.dataframe(scores_df, use_container_width=True, hide_index=True)
-
-    st.markdown("")
-    render_pitch(result["lineup"], result["captain_id"])
-    st.markdown("")
-    render_detail_table(result["lineup"], result["captain_id"])
-else:
-    # Empty State
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown(
-            """
-            <div style="text-align:center; padding:3rem 2rem; background: linear-gradient(135deg, #f8f9fa, #e9ecef);
-                        border-radius:16px; border:1px solid #dee2e6;">
-                <div style="font-size:3rem; margin-bottom:1rem;">🏟️</div>
-                <h3 style="color:#1a1a1a; margin:0 0 0.5rem;">Bereit für den Spieltag?</h3>
-                <p style="color:#666; margin:0; font-size:0.9rem;">
-                    Klicke auf <strong>„Daten neu laden & Optimieren"</strong>, um deine Aufstellung zu generieren.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown("")
+        st.markdown("#### 🏅 Saison-Bonusfragen (Mathematisch ermittelt)")
+        b_col1, b_col2 = st.columns(2)
+        for idx, bq in enumerate(kt_data["bonus_questions"]):
+            target_col = b_col1 if idx % 2 == 0 else b_col2
+            with target_col:
+                with st.expander(f"{bq['question']}", expanded=True):
+                    st.markdown(f"**Tipp:** `{bq['answer']}`")
+                    st.markdown(f"**Wahrscheinlichkeit:** {bq['confidence']}")
+                    st.caption(f"💡 *Begründung:* {bq['reasoning']}")
