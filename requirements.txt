@@ -1,0 +1,7 @@
+streamlit>=1.30
+requests
+beautifulsoup4
+rapidfuzz
+pulp
+pandas
+python-dotenv
